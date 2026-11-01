@@ -349,3 +349,29 @@ test('journey distance within accepted distance: no alert', async () => {
   assert.equal(r.body.booking.legs[0].distance_exceeded, false);
   assert.ok(!get("SELECT 1 FROM notifications WHERE booking_id = ? AND event = 'journey_distance_exceeded'", id));
 });
+
+test('live tracking: map pin is kept, only the assigned chauffeur can share, customer sees position and ETA', async () => {
+  let r = await call('cust', 'POST', '/bookings', request({ pickup_at: future(3), pickup_lat: 52.8061, pickup_lng: -2.1172 }));
+  const id = r.body.id;
+  assert.equal(get('SELECT pickup_lat FROM booking_legs WHERE booking_id = ?', id).pickup_lat, 52.8061, 'pin stored');
+  r = await call('admin', 'POST', `/bookings/${id}/confirm`, { override_reason: 'phone' });
+  const leg = r.body.legs[0];
+  await call('admin', 'POST', `/bookings/${id}/legs/${leg.id}/assign`, { driver_id: get("SELECT id FROM users WHERE email='oliver@encore.test'").id, vehicle_id: get("SELECT id FROM vehicles WHERE status='available' LIMIT 1").id, override_reason: 'test' });
+
+  r = await call('oliver', 'POST', '/driver/location', { leg_id: leg.id, lat: 52.8, lng: -2.1 });
+  assert.equal(r.body.ok, false, 'not shared before setting off');
+  await call('oliver', 'POST', `/bookings/${id}/legs/${leg.id}/status`, { status: 'on_the_way' });
+  r = await call('james', 'POST', '/driver/location', { leg_id: leg.id, lat: 52.8, lng: -2.1 });
+  assert.equal(r.body.ok, false, 'another chauffeur cannot post for this journey');
+  r = await call('oliver', 'POST', '/driver/location', { leg_id: leg.id, lat: 52.79, lng: -2.10, heading: 90, speed: 12 });
+  assert.equal(r.body.ok, true);
+
+  r = await call('cust', 'GET', `/bookings/${id}/live`);
+  assert.equal(r.status, 200);
+  const live = r.body.legs[0];
+  assert.equal(live.driver.lat, 52.79);
+  assert.deepEqual(live.pickup, { lat: 52.8061, lng: -2.1172 });
+  assert.ok(live.eta_s > 0, 'has an ETA');
+  r = await call('corp', 'GET', `/bookings/${id}/live`);
+  assert.notEqual(r.status, 200, 'other customers cannot see it');
+});

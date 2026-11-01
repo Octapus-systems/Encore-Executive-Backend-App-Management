@@ -179,7 +179,9 @@ function driverLeg(l) {
 
 export function navigationUrl(leg) {
   const stops = Array.isArray(leg.stops) ? leg.stops : JSON.parse(leg.stops || '[]');
-  const p = new URLSearchParams({ api: '1', origin: leg.pickup, destination: leg.destination, travelmode: 'driving' });
+  // Prefer the customer's exact map pin over the typed address.
+  const at = (lat, lng, text) => (lat != null && lng != null ? `${lat},${lng}` : text);
+  const p = new URLSearchParams({ api: '1', origin: at(leg.pickup_lat, leg.pickup_lng, leg.pickup), destination: at(leg.dest_lat, leg.dest_lng, leg.destination), travelmode: 'driving' });
   if (stops.length) p.set('waypoints', stops.join('|'));
   return `https://www.google.com/maps/dir/?${p.toString()}`;
 }

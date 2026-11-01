@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { all, get, insert, run, setting, tx, update } from '../db.js';
-import { mapsEnabled, refreshBookingRoutes, refreshLegRoute } from '../maps.js';
+import { coord, mapsEnabled, refreshBookingRoutes, refreshLegRoute } from '../maps.js';
+import { liveView } from '../live.js';
 import {
   audit, bad, conflict, fmtWhen, forbidden, gbp, h, isAdmin, notify, notifyAdmins, requireRole,
 } from '../lib.js';
@@ -75,6 +76,12 @@ r.get('/', h((req, res) => {
 }));
 
 r.get('/:id', h((req, res) => res.json(bookingView(Number(req.params.id), req.user))));
+
+// Live "chauffeur on the way" map: driver position, ETA and road shape for active legs.
+r.get('/:id/live', h(async (req, res) => {
+  const b = loadBookingRow(Number(req.params.id), req.user);
+  res.json(await liveView(b, req.user));
+}));
 
 // ---------- create request (CUS-2) ----------
 function validateRequest(body, staff = false) {
@@ -157,17 +164,25 @@ r.post('/', h((req, res) => {
     });
     run('UPDATE bookings SET ref = ? WHERE id = ?', nextRef(bid), bid);
     const stops = Array.isArray(body.stops) ? body.stops.map((s) => String(s).trim()).filter(Boolean).slice(0, 8) : [];
+    // Exact map pins (optional): where the customer dropped the pickup / destination pin.
+    const pin = coord(body.pickup_lat, body.pickup_lng);
+    const dpin = coord(body.dest_lat, body.dest_lng);
     insert('booking_legs', {
       booking_id: bid, leg_no: 1, label: isReturn ? 'Outbound' : 'Journey',
       pickup: body.pickup.trim(), destination: (body.destination || 'As directed').trim(),
       stops, pickup_at: new Date(body.pickup_at).toISOString(), est_minutes: estMinutes,
+      pickup_lat: pin?.lat ?? null, pickup_lng: pin?.lng ?? null, dest_lat: dpin?.lat ?? null, dest_lng: dpin?.lng ?? null,
     });
     if (isReturn) {
+      const backFromDest = !body.return_pickup;
+      const backToPickup = !body.return_destination;
       insert('booking_legs', {
         booking_id: bid, leg_no: 2, label: 'Return',
         pickup: (body.return_pickup || body.destination || body.pickup).trim(),
         destination: (body.return_destination || body.pickup).trim(),
         stops: [], pickup_at: new Date(body.return_pickup_at).toISOString(), est_minutes: estMinutes,
+        pickup_lat: backFromDest ? dpin?.lat ?? null : null, pickup_lng: backFromDest ? dpin?.lng ?? null : null,
+        dest_lat: backToPickup ? pin?.lat ?? null : null, dest_lng: backToPickup ? pin?.lng ?? null : null,
       });
     }
     audit({ bookingId: bid, entity: 'booking', entityId: bid, action: isAdmin(u) ? 'created_by_staff' : 'requested', actorId: u.id, detail: { status: 'pending' } });
@@ -221,6 +236,9 @@ r.patch('/:id', adminOnly, h(async (req, res) => {
         }
       }
       if (Object.keys(lp).length) {
+        // A retyped address no longer matches the old map pin.
+        if ('pickup' in lp) Object.assign(lp, { pickup_lat: null, pickup_lng: null });
+        if ('destination' in lp) Object.assign(lp, { dest_lat: null, dest_lng: null });
         update('booking_legs', leg.id, lp);
         if (lp.pickup || lp.destination || lp.stops) routeLegs.push(leg.id);
       }

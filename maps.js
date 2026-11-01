@@ -4,7 +4,8 @@ import { all, db, get, run, setting } from './db.js';
 // Results are informational (pricing factor "distance from base", conflict timing) —
 // they never produce a customer price automatically (BRD: no per-mile fares).
 
-for (const col of ['distance_m INTEGER', 'duration_s INTEGER', 'base_distance_m INTEGER', 'base_duration_s INTEGER', 'route_checked_at TEXT', 'route_error TEXT', 'driver_accepted_at TEXT', 'actual_distance_m INTEGER', 'distance_exceeded_notified_at TEXT']) {
+for (const col of ['distance_m INTEGER', 'duration_s INTEGER', 'base_distance_m INTEGER', 'base_duration_s INTEGER', 'route_checked_at TEXT', 'route_error TEXT', 'driver_accepted_at TEXT', 'actual_distance_m INTEGER', 'distance_exceeded_notified_at TEXT',
+  'pickup_lat REAL', 'pickup_lng REAL', 'dest_lat REAL', 'dest_lng REAL']) {
   try { db.exec(`ALTER TABLE booking_legs ADD COLUMN ${col}`); } catch { /* already exists */ }
 }
 
@@ -73,25 +74,27 @@ export function refreshBookingRoutes(bookingId) {
 
 // ---------- Address suggestions (Google Places Autocomplete, UK only) ----------
 const placeCache = new Map();
-export async function suggestPlaces(input, sessionToken) {
+export async function suggestPlaces(input, sessionToken, origin = null) {
   const key = process.env.GOOGLE_MAPS_API_KEY;
   if (!key) throw new Error('Google Maps API key not configured');
   const q = String(input || '').trim().slice(0, 120);
   if (q.length < 3) return [];
-  const ck = q.toLowerCase();
+  const ck = `${q.toLowerCase()}|${origin ? `${origin.lat.toFixed(2)},${origin.lng.toFixed(2)}` : ''}`;
   const hit = placeCache.get(ck);
   if (hit && Date.now() - hit.at < TTL) return hit.value;
   const res = await fetch('https://places.googleapis.com/v1/places:autocomplete', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json', 'X-Goog-Api-Key': key,
-      'X-Goog-FieldMask': 'suggestions.placePrediction.placeId,suggestions.placePrediction.text.text,suggestions.placePrediction.structuredFormat,suggestions.placePrediction.types',
+      'X-Goog-FieldMask': 'suggestions.placePrediction.placeId,suggestions.placePrediction.text.text,suggestions.placePrediction.structuredFormat,suggestions.placePrediction.types,suggestions.placePrediction.distanceMeters',
     },
     body: JSON.stringify({
       input: q, includedRegionCodes: ['gb'], languageCode: 'en-GB',
       // Bias towards Staffordshire / the Midlands without excluding the rest of the UK.
       locationBias: { circle: { center: { latitude: 52.95, longitude: -2.1 }, radius: 50000 } },
       ...(sessionToken ? { sessionToken } : {}),
+      // Straight-line distance from the pickup, shown next to each result.
+      ...(origin ? { origin: { latitude: origin.lat, longitude: origin.lng } } : {}),
     }),
     signal: AbortSignal.timeout(8000),
   });
@@ -103,10 +106,53 @@ export async function suggestPlaces(input, sessionToken) {
     main: p.structuredFormat?.mainText?.text || p.text?.text,
     secondary: p.structuredFormat?.secondaryText?.text || '',
     airport: (p.types || []).includes('airport'),
+    distance_m: p.distanceMeters ?? null,
   }));
   placeCache.set(ck, { at: Date.now(), value });
   if (placeCache.size > 2000) placeCache.delete(placeCache.keys().next().value);
   return value;
+}
+
+/** Valid { lat, lng } from loose input, or null. */
+export function coord(lat, lng) {
+  if (lat == null || lng == null || lat === '' || lng === '') return null;
+  const la = Number(lat); const ln = Number(lng);
+  return Number.isFinite(la) && Number.isFinite(ln) && Math.abs(la) <= 90 && Math.abs(ln) <= 180 ? { lat: la, lng: ln } : null;
+}
+
+/** Address → { lat, lng } (Geocoding API), cached. Used to place pickups typed rather than pinned. */
+export async function geocode(address) {
+  const key = process.env.GOOGLE_MAPS_API_KEY;
+  if (!key) throw new Error('Google Maps API key not configured');
+  const q = String(address || '').trim().slice(0, 200);
+  if (q.length < 3) return null;
+  const ck = `geo:${q.toLowerCase()}`;
+  const hit = placeCache.get(ck);
+  if (hit && Date.now() - hit.at < TTL) return hit.value;
+  const url = `https://maps.googleapis.com/maps/api/geocode/json?address=${encodeURIComponent(q)}&region=gb&key=${key}`;
+  const data = await (await fetch(url, { signal: AbortSignal.timeout(8000) })).json();
+  const loc = data.status === 'OK' ? data.results?.[0]?.geometry?.location : null;
+  const value = loc ? { lat: loc.lat, lng: loc.lng } : null;
+  placeCache.set(ck, { at: Date.now(), value });
+  return value;
+}
+
+/** Live drive from the chauffeur's position to a point: time, distance and the road shape. */
+export async function liveRoute(from, to) {
+  const key = process.env.GOOGLE_MAPS_API_KEY;
+  if (!key) throw new Error('Google Maps API key not configured');
+  const point = (p) => ({ location: { latLng: { latitude: p.lat, longitude: p.lng } } });
+  const res = await fetch('https://routes.googleapis.com/directions/v2:computeRoutes', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Goog-Api-Key': key, 'X-Goog-FieldMask': 'routes.duration,routes.distanceMeters,routes.polyline.encodedPolyline' },
+    body: JSON.stringify({ origin: point(from), destination: point(to), travelMode: 'DRIVE', routingPreference: 'TRAFFIC_AWARE', regionCode: 'GB' }),
+    signal: AbortSignal.timeout(8000),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data?.error?.message || `Routes API HTTP ${res.status}`);
+  const r = data.routes?.[0];
+  if (!r) return null;
+  return { distance_m: r.distanceMeters ?? 0, duration_s: Number(String(r.duration || '0s').replace('s', '')), polyline: r.polyline?.encodedPolyline || null };
 }
 
 /** Turn the customer's GPS position into a readable pickup address (Geocoding API, Places fallback). */

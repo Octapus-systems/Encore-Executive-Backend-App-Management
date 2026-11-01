@@ -32,7 +32,9 @@ export default function handler(req, res) {
     } catch (err) {
       console.error('[snapshot] refresh', err.message);
     }
-    const mutating = !['GET', 'HEAD', 'OPTIONS'].includes(req.method);
+    // Live GPS pings are stored outside the snapshot (server/live.js) — never re-upload the database for them.
+    const ping = req.url?.startsWith('/api/driver/location');
+    const mutating = !ping && !['GET', 'HEAD', 'OPTIONS'].includes(req.method);
     await new Promise((resolve) => {
       if (mutating) {
         // Hold the response until the change is saved to Supabase.

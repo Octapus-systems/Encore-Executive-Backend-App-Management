@@ -6,7 +6,7 @@ import bookingRoutes from './routes/bookings.js';
 import adminRoutes from './routes/admin.js';
 import driverRoutes from './routes/driver.js';
 import { HttpError, authenticate, h, requireRole } from './lib.js';
-import { computeRoute, mapsEnabled, suggestPlaces, reverseGeocode } from './maps.js';
+import { computeRoute, coord, geocode, mapsEnabled, suggestPlaces, reverseGeocode } from './maps.js';
 
 export function createApp() {
   const app = express();
@@ -49,7 +49,7 @@ export function createApp() {
   app.get('/api/places', h(async (req, res) => {
     if (!mapsEnabled()) return res.json([]);
     limit(req);
-    try { res.json(await suggestPlaces(req.query.q, req.query.session)); } catch (e) { console.error('[places]', e.message); res.json([]); }
+    try { res.json(await suggestPlaces(req.query.q, req.query.session, coord(req.query.lat, req.query.lng))); } catch (e) { console.error('[places]', e.message); res.json([]); }
   }));
   // Route preview while booking (distance + drive time only; never a price).
   app.get('/api/places/route', h(async (req, res) => {
@@ -58,6 +58,12 @@ export function createApp() {
     const from = String(req.query.from || '').slice(0, 200); const to = String(req.query.to || '').slice(0, 200);
     if (from.length < 3 || to.length < 3) return res.json(null);
     try { res.json(await computeRoute(from, to)); } catch (e) { console.error('[route]', e.message); res.json(null); }
+  }));
+  // Coordinates for a chosen suggestion (so the planner map can drop a pin on it).
+  app.get('/api/places/geocode', h(async (req, res) => {
+    if (!mapsEnabled()) return res.json(null);
+    limit(req);
+    try { res.json(await geocode(String(req.query.q || '').slice(0, 200))); } catch (e) { console.error('[geocode]', e.message); res.json(null); }
   }));
   app.get('/api/places/reverse', h(async (req, res) => {
     if (!mapsEnabled()) throw new HttpError(503, 'Location lookup is not available.');
