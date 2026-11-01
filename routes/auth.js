@@ -187,7 +187,12 @@ r.patch('/me', authenticate, h((req, res) => {
 export const account = Router();
 
 account.get('/notifications', h((req, res) => {
-  res.json(all('SELECT n.*, b.ref FROM notifications n LEFT JOIN bookings b ON b.id = n.booking_id WHERE n.user_id = ? ORDER BY n.id DESC LIMIT 100', req.user.id));
+  // Management sees who the request is for (traveller name + day-of mobile, falling back to the account holder).
+  const who = req.user.role === 'admin'
+    ? ", COALESCE(NULLIF(b.lead_passenger, ''), c.name) AS customer_name, COALESCE(NULLIF(b.contact_phone, ''), c.phone) AS customer_phone"
+    : '';
+  res.json(all(`SELECT n.*, b.ref${who} FROM notifications n LEFT JOIN bookings b ON b.id = n.booking_id
+    LEFT JOIN users c ON c.id = b.customer_id WHERE n.user_id = ? ORDER BY n.id DESC LIMIT 100`, req.user.id));
 }));
 account.post('/notifications/read-all', h((req, res) => {
   run("UPDATE notifications SET read_at = datetime('now') WHERE user_id = ? AND read_at IS NULL", req.user.id);
