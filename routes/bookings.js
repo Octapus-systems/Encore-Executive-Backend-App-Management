@@ -44,7 +44,7 @@ r.get('/', h((req, res) => {
   const order = {
     pickup: 'first_pickup ASC',
     pickup_desc: 'first_pickup DESC',
-    created: 'b.created_at DESC',
+    created: 'b.created_at DESC, b.id DESC',
     status: 'b.status ASC, first_pickup ASC',
     customer: 'u.name ASC',
   }[sort] || 'first_pickup ASC';
