@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { DEFAULT_SETTINGS, all, get, getSettings, insert, run, setting, tx, update } from '../db.js';
-import { audit, bad, conflict, gbp, h, hashPassword, notFound, notify, publicUser, randomToken } from '../lib.js';
+import { audit, bad, conflict, forbidden, gbp, h, hashPassword, notFound, notify, publicUser, randomToken, staffRole } from '../lib.js';
 import { TERMINAL, agreedTotal, findConflicts, recomputePaymentStatus } from '../domain.js';
 import { computeRoute, mapsEnabled } from '../maps.js';
 
@@ -219,26 +219,143 @@ r.delete('/invitations/:id', h((req, res) => {
   res.json({ ok: true });
 }));
 
-// ---------- staff (admins) ----------
-r.get('/staff', h((_req, res) => res.json(all("SELECT id, name, email, phone, status, created_at FROM users WHERE role = 'admin' ORDER BY name"))));
+// ---------- management users & roles ----------
+// staff_role: 'admin' = full control; 'manager' = can add managers, cannot delete users, change roles or edit admins.
+const STAFF_ROLES = ['admin', 'manager'];
+const STAFF_COLS = 'id, name, email, phone, status, staff_role, created_at';
+const activeAdmins = () => get("SELECT COUNT(*) AS n FROM users WHERE role='admin' AND COALESCE(staff_role,'admin')='admin' AND status='active' AND deleted_at IS NULL").n;
+
+r.get('/staff', h((_req, res) => res.json(all(`SELECT ${STAFF_COLS} FROM users WHERE role = 'admin' AND deleted_at IS NULL ORDER BY CASE COALESCE(staff_role,'admin') WHEN 'admin' THEN 0 ELSE 1 END, name`))));
+
 r.post('/staff', h((req, res) => {
+  const me = staffRole(req.user);
   const { name, email, phone, password } = req.body;
+  const staff_role = req.body.staff_role || 'manager';
+  if (!STAFF_ROLES.includes(staff_role)) throw bad('Role must be admin or manager.');
+  if (me !== 'admin' && staff_role !== 'manager') throw forbidden('Managers can only add other managers.');
   if (!name?.trim() || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email || '') || !password || password.length < 8) throw bad('Name, valid email and a password of at least 8 characters are required.');
   const max = Number(setting('max_admins') || 0);
-  if (max && get("SELECT COUNT(*) AS n FROM users WHERE role='admin' AND status='active'").n >= max) throw conflict(`Your plan allows ${max} management accounts.`);
-  if (get('SELECT 1 FROM users WHERE email = ?', email)) throw conflict('That email is already in use.');
-  const id = insert('users', { name: name.trim(), email: email.trim(), phone: phone || null, password_hash: hashPassword(password), role: 'admin', status: 'active' });
-  audit({ entity: 'user', entityId: id, action: 'staff_added', detail: { name, email }, actorId: req.user.id });
-  res.status(201).json(publicUser(get('SELECT * FROM users WHERE id = ?', id)));
+  if (max && get("SELECT COUNT(*) AS n FROM users WHERE role='admin' AND status='active' AND deleted_at IS NULL").n >= max) throw conflict(`Your plan allows ${max} management accounts.`);
+  if (get('SELECT 1 FROM users WHERE email = ?', email.trim())) throw conflict('That email is already in use.');
+  const id = insert('users', { name: name.trim(), email: email.trim(), phone: phone || null, password_hash: hashPassword(password), role: 'admin', staff_role, status: 'active' });
+  audit({ entity: 'user', entityId: id, action: 'staff_added', detail: { name, email, staff_role }, actorId: req.user.id });
+  res.status(201).json(get(`SELECT ${STAFF_COLS} FROM users WHERE id = ?`, id));
 }));
+
 r.patch('/staff/:id', h((req, res) => {
-  const s = get("SELECT * FROM users WHERE id = ? AND role = 'admin'", req.params.id);
+  const me = staffRole(req.user);
+  const s = get("SELECT * FROM users WHERE id = ? AND role = 'admin' AND deleted_at IS NULL", req.params.id);
   if (!s) throw notFound();
-  if (s.id === req.user.id && req.body.status === 'suspended') throw conflict('You cannot suspend your own account.');
-  const data = pick(req.body, ['name', 'phone', 'status']);
+  if (me !== 'admin') throw forbidden('Only admins can change management users.');
+  const data = pick(req.body, ['name', 'phone', 'status', 'staff_role']);
+  if (data.staff_role && !STAFF_ROLES.includes(data.staff_role)) throw bad('Role must be admin or manager.');
+  if (s.id === req.user.id && (data.status === 'suspended' || data.staff_role === 'manager')) throw conflict('You cannot suspend or demote your own account.');
+  const losingAdmin = (s.staff_role || 'admin') === 'admin' && s.status === 'active' && (data.status === 'suspended' || data.staff_role === 'manager');
+  if (losingAdmin && activeAdmins() <= 1) throw conflict('Keep at least one active admin.');
+  if (req.body.password) {
+    if (String(req.body.password).length < 8) throw bad('Password must be at least 8 characters.');
+    data.password_hash = hashPassword(req.body.password);
+  }
   update('users', s.id, data);
-  audit({ entity: 'user', entityId: s.id, action: 'staff_updated', detail: data, actorId: req.user.id });
-  res.json(publicUser(get('SELECT * FROM users WHERE id = ?', s.id)));
+  const { password_hash: _ph, ...logged } = data;
+  audit({ entity: 'user', entityId: s.id, action: 'staff_updated', detail: { ...logged, ...(data.password_hash ? { password: 'reset' } : {}) }, actorId: req.user.id });
+  res.json(get(`SELECT ${STAFF_COLS} FROM users WHERE id = ?`, s.id));
+}));
+
+// Delete = sign-in removed for good, email freed; their name stays on past bookings and history.
+r.delete('/staff/:id', h((req, res) => {
+  if (staffRole(req.user) !== 'admin') throw forbidden('Only admins can delete management users.');
+  const s = get("SELECT * FROM users WHERE id = ? AND role = 'admin' AND deleted_at IS NULL", req.params.id);
+  if (!s) throw notFound();
+  if (s.id === req.user.id) throw conflict('You cannot delete your own account.');
+  if ((s.staff_role || 'admin') === 'admin' && s.status === 'active' && activeAdmins() <= 1) throw conflict('Keep at least one active admin.');
+  update('users', s.id, { status: 'suspended', deleted_at: new Date().toISOString(), email: `deleted-${s.id}-${s.email}` });
+  audit({ entity: 'user', entityId: s.id, action: 'staff_deleted', detail: { name: s.name, email: s.email }, actorId: req.user.id });
+  res.json({ ok: true });
+}));
+
+// ---------- reports (daily / weekly / monthly / yearly) ----------
+// The client sends the period as UTC instants [from, to). Bookings count in the period of their first pickup.
+const REPORT_BOOKINGS = `
+  SELECT b.id, b.ref, b.status, b.journey_type, b.payment_status, b.payment_arrangement, b.lead_passenger, b.created_at,
+    u.name AS customer_name, o.name AS organisation_name,
+    fl.pickup_at AS first_pickup, fl.pickup, fl.destination,
+    (SELECT COUNT(*) FROM booking_legs WHERE booking_id = b.id) AS legs,
+    (SELECT GROUP_CONCAT(DISTINCT d.name) FROM booking_legs l JOIN users d ON d.id = l.driver_id WHERE l.booking_id = b.id) AS drivers,
+    (SELECT GROUP_CONCAT(DISTINCT v.registration) FROM booking_legs l JOIN vehicles v ON v.id = l.vehicle_id WHERE l.booking_id = b.id) AS vehicles,
+    (SELECT GROUP_CONCAT(DISTINCT eo.name) FROM booking_legs l JOIN external_operators eo ON eo.id = l.external_operator_id WHERE l.booking_id = b.id) AS operators,
+    (SELECT total FROM quotes q WHERE q.booking_id = b.id AND q.status = 'accepted' ORDER BY version DESC LIMIT 1) AS total,
+    (SELECT COALESCE(SUM(CASE WHEN kind='refund' THEN -amount ELSE amount END),0) FROM payments p WHERE p.booking_id = b.id AND outcome='succeeded') AS received
+  FROM bookings b
+  JOIN users u ON u.id = b.customer_id
+  LEFT JOIN organisations o ON o.id = b.organisation_id
+  JOIN booking_legs fl ON fl.booking_id = b.id AND fl.leg_no = (SELECT MIN(leg_no) FROM booking_legs WHERE booking_id = b.id)
+  WHERE fl.pickup_at >= ? AND fl.pickup_at < ? /*FILTER*/
+  ORDER BY fl.pickup_at`;
+const CANCELLED = ['cancelled_customer', 'cancelled_management', 'rejected', 'no_show', 'expired', 'quote_declined'];
+/** Optional subject: one customer, one corporate account, or one chauffeur. */
+function reportFilter(q) {
+  if (q.driver_id) return { sql: ' AND EXISTS (SELECT 1 FROM booking_legs dl WHERE dl.booking_id = b.id AND dl.driver_id = ?)', args: [Number(q.driver_id)] };
+  if (q.organisation_id) return { sql: ' AND b.organisation_id = ?', args: [Number(q.organisation_id)] };
+  if (q.customer_id) return { sql: ' AND b.customer_id = ?', args: [Number(q.customer_id)] };
+  return { sql: '', args: [] };
+}
+function periodSummary(from, to, flt = { sql: '', args: [] }) {
+  const rows = all(REPORT_BOOKINGS.replace('/*FILTER*/', flt.sql), from, to, ...flt.args);
+  const live = rows.filter((b) => !CANCELLED.includes(b.status));
+  return {
+    rows,
+    journeys: live.length,
+    revenue: live.reduce((t, b) => t + (b.total || 0), 0),
+    completed: rows.filter((b) => ['completed', 'closed'].includes(b.status)).length,
+    cancelled: rows.length - live.length,
+  };
+}
+r.get('/reports', h((req, res) => {
+  const { from, to } = req.query;
+  const f = new Date(from), t = new Date(to);
+  if (!from || !to || Number.isNaN(f.getTime()) || Number.isNaN(t.getTime()) || t <= f) throw bad('A valid from/to period is required.');
+  const span = t.getTime() - f.getTime();
+  const flt = reportFilter(req.query);
+  const cur = periodSummary(f.toISOString(), t.toISOString(), flt);
+  const prev = periodSummary(new Date(f.getTime() - span).toISOString(), f.toISOString(), flt);
+  let subject = null;
+  if (req.query.driver_id) {
+    const d = get("SELECT id, name, phone, email, licence_number, driver_type FROM users WHERE id = ? AND role = 'driver'", Number(req.query.driver_id));
+    if (!d) throw notFound();
+    // Time on the job: from "on the way" (or pickup) to completion, for this chauffeur's finished legs.
+    const legs = all(`SELECT l.pickup_at, l.on_the_way_at, l.started_at, l.completed_at, l.est_minutes FROM booking_legs l
+      WHERE l.driver_id = ? AND l.pickup_at >= ? AND l.pickup_at < ?`, d.id, f.toISOString(), t.toISOString());
+    const done = legs.filter((l) => l.completed_at);
+    const minutes = done.reduce((m, l) => {
+      const a = new Date(l.on_the_way_at || l.started_at || l.pickup_at).getTime(), z = new Date(l.completed_at).getTime();
+      return m + (z > a ? Math.min((z - a) / 60000, 24 * 60) : (l.est_minutes || 0));
+    }, 0);
+    subject = { kind: 'driver', ...d, legs: legs.length, legs_done: done.length, minutes: Math.round(minutes) };
+  } else if (req.query.organisation_id) {
+    const o = get('SELECT id, name, billing_email, payment_terms FROM organisations WHERE id = ?', Number(req.query.organisation_id));
+    if (!o) throw notFound();
+    subject = { kind: 'organisation', ...o };
+  } else if (req.query.customer_id) {
+    const c = get("SELECT id, name, email, phone FROM users WHERE id = ? AND role IN ('customer','corporate')", Number(req.query.customer_id));
+    if (!c) throw notFound();
+    subject = { kind: 'customer', ...c };
+  }
+  const cashFilter = flt.sql ? ` AND booking_id IN (SELECT b.id FROM bookings b WHERE 1=1 ${flt.sql})` : '';
+  const cash = get(`SELECT
+      COALESCE(SUM(CASE WHEN kind != 'refund' THEN amount ELSE 0 END),0) AS collected,
+      COALESCE(SUM(CASE WHEN kind = 'refund' THEN amount ELSE 0 END),0) AS refunded,
+      COUNT(*) AS n
+    FROM payments WHERE outcome = 'succeeded' AND created_at >= ? AND created_at < ?${cashFilter}`,
+    f.toISOString().replace('T', ' ').slice(0, 19), t.toISOString().replace('T', ' ').slice(0, 19), ...flt.args);
+  const requests = get(`SELECT COUNT(*) AS n FROM bookings b WHERE b.created_at >= ? AND b.created_at < ?${flt.sql}`,
+    f.toISOString().replace('T', ' ').slice(0, 19), t.toISOString().replace('T', ' ').slice(0, 19), ...flt.args).n;
+  res.json({
+    from: f.toISOString(), to: t.toISOString(), generated_at: new Date().toISOString(), generated_by: req.user.name,
+    company: setting('company_name') || 'Encore Executive',
+    subject, bookings: cur.rows, cash, requests,
+    previous: { journeys: prev.journeys, revenue: prev.revenue, completed: prev.completed, cancelled: prev.cancelled },
+  });
 }));
 
 // ---------- payments overview & corporate invoices (ADM-6) ----------

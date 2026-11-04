@@ -286,6 +286,8 @@ export const DEFAULT_SETTINGS = {
 for (const sql of [
   "ALTER TABLE users ADD COLUMN driver_type TEXT NOT NULL DEFAULT 'regular'",
   'ALTER TABLE users ADD COLUMN access_expires_at TEXT',
+  "ALTER TABLE users ADD COLUMN staff_role TEXT NOT NULL DEFAULT 'admin'",
+  'ALTER TABLE users ADD COLUMN deleted_at TEXT',
 ]) {
   try { db.exec(sql); } catch { /* column already exists */ }
 }

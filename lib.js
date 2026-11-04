@@ -58,7 +58,7 @@ export function authenticate(req, _res, next) {
   try {
     const payload = jwt.verify(token, JWT_SECRET);
     const user = get('SELECT * FROM users WHERE id = ?', payload.sub);
-    if (!user) return next(new HttpError(401, 'Account not found.'));
+    if (!user || user.deleted_at) return next(new HttpError(401, 'Account not found.'));
     if (user.status !== 'active') return next(new HttpError(403, accountStatusMessage(user.status)));
     if (accessExpired(user)) return next(new HttpError(403, ACCESS_EXPIRED));
     req.user = user;
@@ -81,6 +81,8 @@ export const requireRole = (...roles) => (req, _res, next) => {
   next();
 };
 export const isAdmin = (u) => u.role === 'admin';
+/** Management sub-role: 'admin' (full control) or 'manager' (can add managers, cannot delete or change roles). */
+export const staffRole = (u) => (u.role === 'admin' ? (u.staff_role || 'admin') : null);
 export const isCustomerSide = (u) => u.role === 'customer' || u.role === 'corporate';
 
 // ---------- audit ----------
