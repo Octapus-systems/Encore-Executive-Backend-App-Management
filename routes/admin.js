@@ -274,6 +274,25 @@ r.delete('/staff/:id', h((req, res) => {
   res.json({ ok: true });
 }));
 
+// ---------- customer conversations (inbox) ----------
+// One conversation per booking. "waiting" = customer messages sent after Encore's last reply.
+r.get('/conversations', h((_req, res) => {
+  res.json(all(`
+    SELECT b.id, b.ref, b.status, b.lead_passenger, u.name AS customer_name, u.phone AS customer_phone, o.name AS organisation_name,
+      lm.body AS last_body, lm.kind AS last_kind, lm.created_at AS last_at, la.role AS last_role, la.name AS last_author,
+      (SELECT COUNT(*) FROM messages m JOIN users a ON a.id = m.author_id WHERE m.booking_id = b.id) AS total,
+      (SELECT COUNT(*) FROM messages m JOIN users a ON a.id = m.author_id
+        WHERE m.booking_id = b.id AND a.role != 'admin'
+          AND m.id > COALESCE((SELECT MAX(m2.id) FROM messages m2 JOIN users a2 ON a2.id = m2.author_id WHERE m2.booking_id = b.id AND a2.role = 'admin'), 0)) AS waiting,
+      (SELECT MIN(pickup_at) FROM booking_legs WHERE booking_id = b.id) AS first_pickup
+    FROM bookings b
+    JOIN messages lm ON lm.id = (SELECT MAX(id) FROM messages WHERE booking_id = b.id)
+    JOIN users la ON la.id = lm.author_id
+    JOIN users u ON u.id = b.customer_id
+    LEFT JOIN organisations o ON o.id = b.organisation_id
+    ORDER BY (waiting > 0) DESC, lm.id DESC`));
+}));
+
 // ---------- reports (daily / weekly / monthly / yearly) ----------
 // The client sends the period as UTC instants [from, to). Bookings count in the period of their first pickup.
 const REPORT_BOOKINGS = `
